@@ -306,10 +306,12 @@ export async function countDrivers(companyId: string): Promise<number> {
   return (await C.drivers()).countDocuments({ companyId });
 }
 
-export async function addDriver(
-  companyId: string,
-  input: DriverInput,
-): Promise<{ driver: Driver; cred: DriverCred } | null> {
+/** Distinguishes "name taken" from "driver ID taken" for the caller. */
+export type AddDriverResult =
+  | { ok: true; driver: Driver; cred: DriverCred }
+  | { ok: false; reason: "name" | "driverId" };
+
+export async function addDriver(companyId: string, input: DriverInput): Promise<AddDriverResult> {
   const initials = initialsOf(input.name);
   const n = await countDrivers(companyId);
   const d: Driver = {
@@ -328,34 +330,88 @@ export async function addDriver(
   try {
     await (await C.drivers()).insertOne({ ...d, companyId, addedAt: Date.now() } as never);
   } catch (e) {
-    if (isDuplicate(e)) return null;
+    if (isDuplicate(e)) return { ok: false, reason: "name" };
     throw e;
   }
 
-  // Driver IDs stay unique across every company so the login form needs no
-  // company code. The unique index decides the winner if two race.
   const creds = await C.driverCreds();
-  let cred: DriverCred | null = null;
-  for (let attempt = 0; attempt < 20 && !cred; attempt++) {
-    const candidate: DriverCred = {
+  const pin = input.pin || String(randomInt(1000, 9999));
+  const rollback = async () => {
+    // Never leave behind a driver who has no way to log in.
+    await (await C.drivers()).deleteOne({ companyId, name: input.name });
+  };
+
+  // An owner-chosen ID is used as-is; a clash is their error to fix, not
+  // something to silently work around.
+  if (input.driverId) {
+    const cred: DriverCred = { driverId: input.driverId, pin, name: input.name, plate: input.vehicle };
+    try {
+      await creds.insertOne({ ...cred, companyId });
+      return { ok: true, driver: d, cred };
+    } catch (e) {
+      if (isDuplicate(e)) {
+        await rollback();
+        return { ok: false, reason: "driverId" };
+      }
+      throw e;
+    }
+  }
+
+  // Otherwise mint one. Driver IDs are unique across every company so the login
+  // form needs no company code; the unique index decides the winner if two race.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const cred: DriverCred = {
       driverId: initials + String(randomInt(10, 99)),
-      pin: String(randomInt(1000, 9999)),
+      pin,
       name: input.name,
       plate: input.vehicle,
     };
     try {
-      await creds.insertOne({ ...candidate, companyId });
-      cred = candidate;
+      await creds.insertOne({ ...cred, companyId });
+      return { ok: true, driver: d, cred };
     } catch (e) {
       if (!isDuplicate(e)) throw e;
     }
   }
-  if (!cred) {
-    // Could not mint an ID — do not leave a driver who can never log in.
-    await (await C.drivers()).deleteOne({ companyId, name: input.name });
-    throw new Error("Could not allocate a driver ID — try a different name");
+  await rollback();
+  throw new Error("Could not allocate a driver ID — set one manually");
+}
+
+/**
+ * Reset a driver's PIN and/or reissue their ID. Returns the full credential so
+ * the owner can hand it over; null if there is no such driver.
+ */
+export async function setDriverCredentials(
+  companyId: string,
+  name: string,
+  patch: { driverId?: string; pin?: string },
+): Promise<DriverCred | "taken" | null> {
+  const driver = await findDriver(companyId, name);
+  if (!driver) return null;
+
+  const creds = await C.driverCreds();
+  const existing = await creds.findOne({ companyId, name: driver.name });
+  if (!existing) return null;
+
+  const next: DriverCred = {
+    driverId: patch.driverId || existing.driverId,
+    pin: patch.pin || String(randomInt(1000, 9999)),
+    name: driver.name,
+    plate: driver.vehicle,
+  };
+
+  try {
+    await creds.replaceOne({ companyId, driverId: existing.driverId }, { ...next, companyId });
+  } catch (e) {
+    if (isDuplicate(e)) return "taken";
+    throw e;
   }
-  return { driver: d, cred };
+
+  // Changing an ID must invalidate sessions issued under the old one.
+  if (next.driverId !== existing.driverId) {
+    await (await C.sessions()).deleteMany({ "session.driverId": existing.driverId });
+  }
+  return next;
 }
 
 export async function updateDriver(
@@ -491,6 +547,14 @@ export async function listTrips(
   return (await C.trips()).find(q, { projection: { _id: 0, companyId: 0, createdAt: 0 } })
     .sort({ createdAt: -1 })
     .limit(200)
+    .toArray();
+}
+
+/** Trips closed since a timestamp — powers the dashboard's "Today" panel. */
+export async function listTripsSince(companyId: string, since: number): Promise<Trip[]> {
+  return (await C.trips())
+    .find({ companyId, createdAt: { $gte: since } }, { projection: { _id: 0, companyId: 0, createdAt: 0 } })
+    .sort({ createdAt: -1 })
     .toArray();
 }
 
@@ -873,6 +937,46 @@ export async function markNotificationsRead(companyId: string, ids?: string[]): 
 const parseInr = (s: string) => Number(s.replace(/[^\d.]/g, "")) || 0;
 const parseKm = (s: string) => Number(s.replace(/[^\d.]/g, "")) || 0;
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const monthKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}`;
+
+/**
+ * Revenue and spend bucketed by month for the trend chart. Built from real
+ * timestamps, so a new company sees a flat line rather than someone else's
+ * numbers. Returns the last `count` months including the current one.
+ */
+async function monthlySeries(companyId: string, count = 6) {
+  const [tripDocs, fuel, expenses, maint] = await Promise.all([
+    (await C.trips()).find({ companyId }, { projection: { _id: 0, rev: 1, createdAt: 1 } }).toArray(),
+    listFuelLogs(companyId),
+    listExpenses(companyId),
+    listMaintenance(companyId),
+  ]);
+
+  const buckets = new Map<string, { month: string; revenueInr: number; expensesInr: number }>();
+  const now = new Date();
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    buckets.set(monthKey(d), { month: MONTHS[d.getMonth()], revenueInr: 0, expensesInr: 0 });
+  }
+
+  const addTo = (when: Date, field: "revenueInr" | "expensesInr", amount: number) => {
+    const b = buckets.get(monthKey(when));
+    if (b) b[field] += amount;
+  };
+
+  for (const t of tripDocs) addTo(new Date(t.createdAt), "revenueInr", parseInr(t.rev));
+  for (const f of fuel) addTo(new Date(f.ts), "expensesInr", f.amountInr);
+  for (const e of expenses) addTo(new Date(`${e.date}T00:00:00`), "expensesInr", e.amountInr);
+  for (const m of maint) addTo(new Date(m.createdAt), "expensesInr", m.costInr ?? 0);
+
+  return [...buckets.values()].map((b) => ({
+    month: b.month,
+    revenueInr: Math.round(b.revenueInr),
+    expensesInr: Math.round(b.expensesInr),
+  }));
+}
+
 export async function buildReport(companyId: string, alertDays: number) {
   const [vehicles, drivers, trips, fuel, expenses, maint, invoices] = await Promise.all([
     listVehicles(companyId),
@@ -935,8 +1039,26 @@ export async function buildReport(companyId: string, alertDays: number) {
   const byCategory: Record<string, number> = { fuel: fuelSpend, maintenance: maintenanceSpend };
   for (const e of expenses) byCategory[e.category] = (byCategory[e.category] ?? 0) + e.amountInr;
 
-  const docs = await expiringDocuments(companyId, alertDays);
+  const [docs, monthly] = await Promise.all([
+    expiringDocuments(companyId, alertDays),
+    monthlySeries(companyId),
+  ]);
   return {
+    monthly,
+    /** Next few service jobs, for the maintenance pipeline panel. */
+    pipeline: [...maint]
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+      .slice(0, 4)
+      .map((m) => ({
+        id: m.id,
+        plate: m.plate,
+        type: m.type,
+        dueDate: m.dueDate,
+        costInr: m.costInr,
+        vendor: m.vendor,
+        status: m.status,
+        daysLeft: daysUntil(m.dueDate),
+      })),
     totals: {
       vehicles: vehicles.length,
       drivers: drivers.length,

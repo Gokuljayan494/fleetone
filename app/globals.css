@@ -132,8 +132,13 @@ table.tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}
 .btn-p{background:linear-gradient(135deg,#6366F1,#7C5CF6);color:#fff;box-shadow:0 4px 12px -3px rgba(99,102,241,.5)}
 .btn-s{background:var(--card);border-color:var(--line);color:var(--ink);box-shadow:0 1px 2px rgba(15,23,42,.06)}
 .btn-g{color:var(--mut)}
+/* destructive: filled for the final confirm, tinted outline for row actions */
+.btn-d{background:var(--red);color:#fff;box-shadow:0 4px 12px -3px rgba(185,28,28,.45)}
+.btn-s.danger{color:var(--red-ink);border-color:var(--red-soft)}
+.btn-s.danger:hover{background:var(--red-soft)}
 .btn svg{width:13px;height:13px}
 .btn.full{width:100%;justify-content:center}
+.btn:disabled{opacity:.6;cursor:not-allowed;transform:none}
 
 /* ---- bars & rings ---- */
 .bar{height:5px;border-radius:99px;background:var(--bg);overflow:hidden;border:1px solid var(--hair);flex:1}

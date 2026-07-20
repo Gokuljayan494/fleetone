@@ -5,28 +5,24 @@ import { RealMap } from "@/components/RealMap";
 import { I } from "@/components/Icons";
 import { Av, Badge, Bar, Sparkline, VehDot } from "@/components/ui";
 import { getSession } from "@/lib/auth";
-import { bootstrap, countDrivers, countVehicles, getCompany, listTrips } from "@/lib/store";
+import {
+  bootstrap,
+  buildReport,
+  getCompany,
+  listTrips,
+  listTripsSince,
+  listVehicles,
+  livePositions,
+} from "@/lib/store";
 import type { Trip } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-const kpis = [
-  { icon: "truck", tone: "ind", label: "Total Vehicles", value: <Counter to={48} />, trend: { cls: "up", text: "↑ 4 this month" }, spark: [24, 22, 23, 18, 19, 14, 12, 6], c: "var(--c1)" },
-  { icon: "bolt", tone: "emr", label: "Vehicles Online", value: <><Counter to={42} /><small> / 48</small></>, trend: { cls: "up", text: "87.5% uptime" }, spark: [18, 14, 16, 10, 12, 8, 10, 7], c: "var(--c2)" },
-  { icon: "route", tone: "sky", label: "Active Trips", value: <Counter to={17} />, trend: { cls: "up", text: "↑ 12% vs last week" }, spark: [22, 20, 24, 16, 18, 11, 14, 8], c: "var(--c3)" },
-  { icon: "chart", tone: "ind", label: "Monthly Revenue", value: <>₹<Counter to={12.4} decimals={1} />L</>, trend: { cls: "up", text: "↑ 18.2% MoM" }, spark: [25, 23, 20, 21, 15, 13, 9, 5], c: "var(--c1)" },
-  { icon: "fuel", tone: "org", label: "Fuel Cost · July", value: <>₹<Counter to={2.86} decimals={2} />L</>, trend: { cls: "dn", text: "↑ 6.4% — diesel hike" }, spark: [20, 21, 18, 19, 16, 17, 13, 11], c: "var(--c4)" },
-  { icon: "wrench", tone: "sky", label: "Maintenance Cost", value: <>₹<Counter to={64} />K</>, trend: { cls: "up", text: "↓ 11% vs June" }, spark: [10, 14, 12, 17, 15, 19, 18, 21], c: "var(--c3)" },
-  { icon: "users", tone: "emr", label: "Driver Utilization", value: <><Counter to={81} /><small>%</small></>, trend: { cls: "up", text: "↑ 3.5 pts" }, spark: [19, 17, 18, 14, 15, 12, 10, 9], c: "var(--c2)" },
-  { icon: "heart", tone: "ind", label: "Fleet Health Score", value: <><Counter to={92} /><small> / 100</small></>, trend: { cls: "up", text: "Excellent" }, spark: [16, 15, 13, 14, 11, 10, 8, 7], c: "var(--c1)" },
-];
+/** Sparkline shapes are decorative; the numbers beside them are real. */
+const FLAT = [12, 12, 12, 12, 12, 12, 12, 12];
 
-const fleetStatus = [
-  { tone: "emr" as const, label: "Moving", pct: 64, n: 27, color: "var(--emr)" },
-  { tone: "org" as const, label: "Idle", pct: 26, n: 11, color: "var(--org)" },
-  { tone: "slate" as const, label: "Offline", pct: 14, n: 6, color: "var(--soft)" },
-  { tone: "sky" as const, label: "In service", pct: 9, n: 4, color: "var(--sky)" },
-];
+const lakh = (n: number) =>
+  n >= 100_000 ? `₹${(n / 100_000).toFixed(2)}L` : n >= 1000 ? `₹${Math.round(n / 1000)}K` : `₹${n}`;
 
 export default async function Dashboard() {
   await bootstrap();
@@ -34,15 +30,77 @@ export default async function Dashboard() {
 
   let trips: Trip[] = [];
   let sub = "Sign in to see your fleet";
+  let kpis: {
+    icon: string; tone: string; label: string;
+    value: React.ReactNode; trend: { cls: string; text: string }; c: string;
+  }[] = [];
+  let fleetStatus: { tone: "emr" | "org" | "slate" | "sky"; label: string; pct: number; n: number; color: string }[] = [];
+  let attention: { href: string; cls: string; icon: string; text: string; strong: string }[] = [];
+  let todayTrips = 0;
+  let todayCollected = 0;
+  let liveCount = 0;
+
   if (session) {
-    const [company, vehicles, drivers, t] = await Promise.all([
+    const [company, vehicles, report, live] = await Promise.all([
       getCompany(session.companyId),
-      countVehicles(session.companyId),
-      countDrivers(session.companyId),
-      listTrips(session.companyId),
+      listVehicles(session.companyId),
+      buildReport(session.companyId, 30),
+      livePositions(session.companyId),
     ]);
-    trips = t;
-    if (company) sub = `${company.name} · ${vehicles} vehicles · ${drivers} drivers`;
+    trips = await listTrips(session.companyId);
+    liveCount = live.length;
+
+    if (company) sub = `${company.name} · ${vehicles.length} vehicles · ${report.totals.drivers} drivers`;
+
+    const t = report.totals;
+    const thisMonth = report.monthly[report.monthly.length - 1] ?? { revenueInr: 0, expensesInr: 0 };
+    const fuelSpend = report.expensesByCategory.fuel ?? 0;
+    const maintSpend = report.expensesByCategory.maintenance ?? 0;
+    const avgHealth = vehicles.length
+      ? Math.round(vehicles.reduce((s, v) => s + v.health, 0) / vehicles.length)
+      : 0;
+    const onTrip = vehicles.filter((v) => /trip|transit/i.test(v.status)).length;
+
+    kpis = [
+      { icon: "truck", tone: "ind", label: "Total Vehicles", value: <Counter to={vehicles.length} />, trend: { cls: "up", text: `${report.totals.drivers} drivers` }, c: "var(--c1)" },
+      { icon: "bolt", tone: "emr", label: "Vehicles Online", value: <><Counter to={liveCount} /><small> / {vehicles.length}</small></>, trend: { cls: liveCount ? "up" : "dn", text: liveCount ? "reporting now" : "none reporting" }, c: "var(--c2)" },
+      { icon: "route", tone: "sky", label: "Trips Recorded", value: <Counter to={t.trips} />, trend: { cls: "up", text: `${t.km.toLocaleString("en-IN")} km total` }, c: "var(--c3)" },
+      { icon: "chart", tone: "ind", label: "Revenue · this month", value: <>{lakh(thisMonth.revenueInr)}</>, trend: { cls: "up", text: `${lakh(t.revenueInr)} all time` }, c: "var(--c1)" },
+      { icon: "fuel", tone: "org", label: "Fuel Spend", value: <>{lakh(fuelSpend)}</>, trend: { cls: "dn", text: t.fleetAvgKmpl ? `${t.fleetAvgKmpl} km/L avg` : "no logs yet" }, c: "var(--c4)" },
+      { icon: "wrench", tone: "sky", label: "Maintenance Spend", value: <>{lakh(maintSpend)}</>, trend: { cls: "up", text: `${report.alerts.serviceDue} due soon` }, c: "var(--c3)" },
+      { icon: "users", tone: "emr", label: "Profit", value: <>{lakh(t.profitInr)}</>, trend: { cls: t.profitInr >= 0 ? "up" : "dn", text: `${lakh(t.expensesInr)} spent` }, c: "var(--c2)" },
+      { icon: "heart", tone: "ind", label: "Fleet Health Score", value: <><Counter to={avgHealth} /><small> / 100</small></>, trend: { cls: avgHealth >= 80 ? "up" : "dn", text: avgHealth >= 80 ? "Healthy" : "Needs attention" }, c: "var(--c1)" },
+    ];
+
+    const parked = vehicles.length - onTrip - liveCount > 0 ? vehicles.length - onTrip : 0;
+    const pct = (n: number) => (vehicles.length ? Math.round((n / vehicles.length) * 100) : 0);
+    fleetStatus = [
+      { tone: "emr", label: "On trip", pct: pct(onTrip), n: onTrip, color: "var(--emr)" },
+      { tone: "sky", label: "Reporting", pct: pct(liveCount), n: liveCount, color: "var(--sky)" },
+      { tone: "slate", label: "Parked", pct: pct(parked), n: parked, color: "var(--soft)" },
+      { tone: "org", label: "In service", pct: pct(report.alerts.serviceDue), n: report.alerts.serviceDue, color: "var(--org)" },
+    ];
+
+    if (report.alerts.serviceDue > 0) {
+      attention.push({ href: "/maintenance", cls: "warn", icon: "wrench", text: "Service due — ", strong: `${report.alerts.serviceDue} job${report.alerts.serviceDue === 1 ? "" : "s"}` });
+    }
+    if (report.alerts.expiringDocuments > 0) {
+      attention.push({ href: "/documents", cls: "crit", icon: "shield", text: "Documents expiring — ", strong: `${report.alerts.expiringDocuments}` });
+    }
+    if (report.receivables.overdueInr > 0) {
+      attention.push({ href: "/billing", cls: "crit", icon: "doc", text: "Overdue invoices — ", strong: lakh(report.receivables.overdueInr) });
+    }
+    const worst = [...vehicles].sort((a, b) => a.health - b.health)[0];
+    if (worst && worst.health < 70) {
+      attention.push({ href: "/vehicles", cls: "warn", icon: "heart", text: "Low health — ", strong: worst.plate });
+    }
+
+    // "Today" panel — trips closed since midnight.
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    const todays = await listTripsSince(session.companyId, midnight.getTime());
+    todayTrips = todays.length;
+    todayCollected = todays.reduce((s, x) => s + (Number(x.rev.replace(/[^\d.]/g, "")) || 0), 0);
   }
   const greeting = session ? `Good morning, ${session.name} 👋` : "Good morning 👋";
   return (
@@ -61,7 +119,7 @@ export default async function Dashboard() {
               <div className="val">{k.value}</div>
               <div className="foot">
                 <span className={`trend ${k.trend.cls}`}>{k.trend.text}</span>
-                <Sparkline points={k.spark} color={k.c} />
+                <Sparkline points={FLAT} color={k.c} />
               </div>
             </div>
           ))}
@@ -71,7 +129,7 @@ export default async function Dashboard() {
           <div className="card" style={{ overflow: "hidden" }}>
             <div className="card-h" style={{ paddingBottom: 12 }}>
               <h3>Live Fleet Map</h3>
-              <Badge tone="emr">42 live</Badge>
+              <Badge tone={liveCount ? "emr" : "slate"}>{liveCount} live</Badge>
               <div className="right">
                 <div className="chip-tabs"><span className="on">Traffic</span><span>Satellite</span><span>Geofences</span></div>
               </div>
@@ -98,19 +156,27 @@ export default async function Dashboard() {
                 Needs attention
               </h3>
               <div className="col" style={{ gap: 8 }}>
-                <Link href="/maintenance" className="attention warn"><I name="wrench" />Maintenance due — <b>3 vehicles</b></Link>
-                <Link href="/vehicles" className="attention crit"><I name="shield" />Insurance expiring — <b>2 in 7 days</b></Link>
-                <Link href="/vehicles" className="attention warn"><I name="fuel" />Fuel low — <b>KA 03 HT 8874</b></Link>
+                {attention.length === 0 ? (
+                  <span style={{ fontSize: 12, color: "var(--mut)" }}>Nothing needs attention right now.</span>
+                ) : (
+                  attention.map((a) => (
+                    <Link key={a.href + a.strong} href={a.href} className={`attention ${a.cls}`}>
+                      <I name={a.icon} />{a.text}<b>{a.strong}</b>
+                    </Link>
+                  ))
+                )}
               </div>
             </div>
             <div className="card" style={{ padding: "14px 16px" }}>
               <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline" }}>
                 <h3 style={{ fontSize: 13.5 }}>Today</h3>
-                <span style={{ fontSize: 10.5, color: "var(--soft)", fontWeight: 600 }}>17 JUL</span>
+                <span style={{ fontSize: 10.5, color: "var(--soft)", fontWeight: 600 }}>
+                  {new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short" }).toUpperCase()}
+                </span>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 11 }}>
-                <div className="mini-stat"><b>23</b><div>Trips done</div></div>
-                <div className="mini-stat"><b>₹86K</b><div>Collected</div></div>
+                <div className="mini-stat"><b>{todayTrips}</b><div>Trips done</div></div>
+                <div className="mini-stat"><b>{lakh(todayCollected)}</b><div>Collected</div></div>
               </div>
             </div>
           </div>

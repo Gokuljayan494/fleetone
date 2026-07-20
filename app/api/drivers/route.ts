@@ -20,5 +20,8 @@ export async function POST(req: Request) {
   if (body instanceof NextResponse) return body;
 
   const created = await addDriver(ctx.companyId, body);
-  return created ? ok(created, 201) : invalid({ name: "A driver with this name already exists" }, 409);
+  if (created.ok) return ok({ driver: created.driver, cred: created.cred }, 201);
+  return created.reason === "name"
+    ? invalid({ name: "A driver with this name already exists" }, 409)
+    : invalid({ driverId: "That driver ID is taken — pick another" }, 409);
 }

@@ -32,8 +32,43 @@ export const DriverSchema = z.object({
     .regex(/^\d{4}-\d{2}-\d{2}$/, "Pick a date")
     .refine((d) => new Date(d) > new Date(), "License is already expired"),
   vehicle: z.string().trim().min(1, "Assign a vehicle"),
+  /**
+   * Optional login credentials. Left blank, the server generates them.
+   * The pattern must match DriverLoginSchema or the driver cannot sign in.
+   */
+  driverId: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{1,3}\d{2}$/, "Like SK01 — 1-3 letters then 2 digits")
+    .optional()
+    .or(z.literal("")),
+  pin: z
+    .string()
+    .trim()
+    .regex(/^\d{4}$/, "4-digit PIN")
+    .optional()
+    .or(z.literal("")),
 });
 export type DriverInput = z.infer<typeof DriverSchema>;
+
+/** Owner resetting a driver's PIN, or reissuing their ID. */
+export const DriverCredentialSchema = z.object({
+  driverId: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{1,3}\d{2}$/, "Like SK01 — 1-3 letters then 2 digits")
+    .optional()
+    .or(z.literal("")),
+  pin: z
+    .string()
+    .trim()
+    .regex(/^\d{4}$/, "4-digit PIN")
+    .optional()
+    .or(z.literal("")),
+});
+export type DriverCredentialInput = z.infer<typeof DriverCredentialSchema>;
 
 export const FuelLogSchema = z.object({
   plate: z.string().trim().min(1, "Pick a vehicle"),
@@ -178,7 +213,8 @@ export const VehiclePatchSchema = VehicleSchema.partial()
   .omit({ plate: true })
   .extend({ status: z.string().trim().min(2).max(40).optional() });
 
-export const DriverPatchSchema = DriverSchema.partial().omit({ name: true });
+/** Credentials are changed through their own endpoint, not the profile patch. */
+export const DriverPatchSchema = DriverSchema.partial().omit({ name: true, driverId: true, pin: true });
 
 export const NotificationsReadSchema = z.object({
   ids: z.array(z.string()).optional(),

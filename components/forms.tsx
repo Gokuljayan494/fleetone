@@ -31,6 +31,61 @@ export function Field({ label, error, children, wide }: { label: string; error?:
 }
 
 /**
+ * Destructive actions always go through this: a named confirmation, the server's
+ * own refusal surfaced verbatim (e.g. "this customer has invoices"), and no
+ * optimistic removal until the DELETE actually succeeds.
+ */
+export function ConfirmDelete({
+  title,
+  body,
+  confirmLabel,
+  url,
+  onClose,
+  onDeleted,
+}: {
+  title: string;
+  body: ReactNode;
+  confirmLabel: string;
+  url: string;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run() {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(url, { method: "DELETE" });
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}));
+        setError(b.error ?? "Could not delete — try again");
+        return;
+      }
+      onDeleted();
+    } catch {
+      setError("Network error — try again");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title={title} onClose={onClose}>
+      <p style={{ fontSize: 12.5, color: "var(--mut)", lineHeight: 1.55 }}>{body}</p>
+      {error && <div className="form-err">{error}</div>}
+      <div className="factions">
+        <button type="button" className="btn btn-s" onClick={onClose}>Cancel</button>
+        <button type="button" className="btn btn-d" onClick={run} disabled={busy}>
+          {busy ? "Deleting…" : confirmLabel}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/**
  * Client-side zod validation + POST. Returns field errors keyed like the schema,
  * `form` for request-level failures. Server re-validates with the same schema.
  */
