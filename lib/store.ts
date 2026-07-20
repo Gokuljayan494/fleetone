@@ -535,6 +535,43 @@ export async function livePositions(companyId: string, plate?: string): Promise<
   return (await C.positions()).find(q, NO_ID).toArray();
 }
 
+/** How stale a fix is, so the map can distinguish "moving now" from "parked here yesterday". */
+export type FixStatus = "moving" | "idle" | "stale" | "offline";
+
+export function fixStatus(ageMs: number, speed: number): FixStatus {
+  if (ageMs > 24 * 3600_000) return "offline";
+  if (ageMs > 15 * 60_000) return "stale";
+  return speed > 3 ? "moving" : "idle";
+}
+
+/**
+ * Every vehicle's most recent fix regardless of age, plus the vehicles that have
+ * never reported. The map needs this: filtering to the last 5 minutes leaves it
+ * blank whenever nothing happens to be driving right now.
+ */
+export async function lastKnownPositions(companyId: string, plate?: string) {
+  const q: Record<string, unknown> = { companyId };
+  if (plate) q.plate = plate;
+
+  const [fixes, vehicles] = await Promise.all([
+    (await C.positions()).find(q, NO_ID).toArray(),
+    listVehicles(companyId),
+  ]);
+
+  const now = Date.now();
+  const positions = fixes.map((p) => {
+    const ageMs = now - p.ts;
+    return { ...p, ageMs, status: fixStatus(ageMs, p.speed) };
+  });
+
+  const reporting = new Set(positions.map((p) => p.plate));
+  const missing = vehicles
+    .filter((v) => !reporting.has(v.plate) && (!plate || v.plate === plate))
+    .map((v) => ({ plate: v.plate, model: v.model, driver: v.driver }));
+
+  return { positions, missing };
+}
+
 /* -------------------------------------------------------------------- trips */
 
 export async function listTrips(
@@ -1100,6 +1137,7 @@ export function bootstrap(): Promise<void> {
   if (!gs.__fleetBoot) {
     gs.__fleetBoot = C.ready()
       .then(() => seedDemo())
+      .then(() => seedDemoPositions())
       .catch((err) => {
         // Let the next request retry rather than caching a failure forever.
         gs.__fleetBoot = undefined;
@@ -1107,6 +1145,57 @@ export function bootstrap(): Promise<void> {
       });
   }
   return gs.__fleetBoot;
+}
+
+/**
+ * Positions for the demo fleet, so the map shows something on the demo login.
+ * Runs only for the `demo` company and only while it has none — a real company
+ * never gets invented locations. Every fix is tagged `source: "sim"`, which the
+ * map surfaces in the popup so nobody mistakes it for a real tracker.
+ */
+export async function seedDemoPositions(): Promise<void> {
+  const positions = await C.positions();
+  if (await positions.countDocuments({ companyId: "demo" })) return;
+
+  const demoVehicles = await listVehicles("demo");
+  if (demoVehicles.length === 0) return;
+
+  // Points along the Bengaluru–Chennai and Bengaluru–Hosur corridors.
+  const ROUTES: { lat: number; lng: number; speed: number; ageMin: number }[] = [
+    { lat: 12.9698, lng: 77.7500, speed: 46, ageMin: 1 },   // Whitefield
+    { lat: 12.7409, lng: 77.8253, speed: 58, ageMin: 2 },   // Hosur
+    { lat: 12.9165, lng: 79.1325, speed: 0, ageMin: 4 },    // Vellore, stopped
+    { lat: 13.0827, lng: 80.2707, speed: 32, ageMin: 3 },   // Chennai
+    { lat: 12.2958, lng: 76.6394, speed: 0, ageMin: 45 },   // Mysuru, stale
+    { lat: 13.3409, lng: 74.7421, speed: 0, ageMin: 2600 }, // Udupi, offline
+  ];
+
+  const now = Date.now();
+  const tracksCol = await C.tracks();
+
+  for (const [i, v] of demoVehicles.entries()) {
+    const r = ROUTES[i % ROUTES.length];
+    const ts = now - r.ageMin * 60_000;
+
+    await positions.updateOne(
+      { companyId: "demo", plate: v.plate },
+      { $set: { companyId: "demo", plate: v.plate, lat: r.lat, lng: r.lng, speed: r.speed, source: "sim", ts } },
+      { upsert: true },
+    );
+
+    // A short trail behind each vehicle so the route line has something to draw.
+    const points = Array.from({ length: 8 }, (_, k) => ({
+      lat: r.lat - (7 - k) * 0.012,
+      lng: r.lng - (7 - k) * 0.017,
+      ts: ts - (7 - k) * 60_000,
+      speed: r.speed,
+    }));
+    await tracksCol.updateOne(
+      { companyId: "demo", plate: v.plate },
+      { $set: { companyId: "demo", plate: v.plate, points } },
+      { upsert: true },
+    );
+  }
 }
 
 /**
