@@ -60,6 +60,8 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
   const lastFixTs = useRef<number>(0);
   const watchId = useRef<number | null>(null);
   const simTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wakeLock = useRef<WakeLockSentinel | null>(null);
+  const [screenLocked, setScreenLocked] = useState(false);
 
   const active = trip !== null;
   const onBreak = trip?.pauseStartedAt != null;
@@ -159,6 +161,32 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onFix]);
 
+  // Keep the screen awake during a trip. This is what stops the phone dimming
+  // and suspending the page mid-drive — the usual cause of "it stopped when I
+  // put the phone down". The OS still suspends us if the driver hard-locks the
+  // phone; a hardware tracker is the only true screen-off answer.
+  const acquireWakeLock = useCallback(async () => {
+    try {
+      if ("wakeLock" in navigator) {
+        wakeLock.current = await navigator.wakeLock.request("screen");
+        wakeLock.current.addEventListener?.("release", () => {
+          wakeLock.current = null;
+        });
+      }
+    } catch {
+      /* denied or unsupported — the trip still tracks while the tab is visible */
+    }
+  }, []);
+
+  const releaseWakeLock = useCallback(async () => {
+    try {
+      await wakeLock.current?.release();
+    } catch {
+      /* already gone */
+    }
+    wakeLock.current = null;
+  }, []);
+
   const stopTracking = useCallback(() => {
     if (watchId.current !== null) {
       navigator.geolocation.clearWatch(watchId.current);
@@ -168,11 +196,13 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
       clearInterval(simTimer.current);
       simTimer.current = null;
     }
-  }, []);
+    void releaseWakeLock();
+  }, [releaseWakeLock]);
 
   const beginTracking = useCallback(
     (t: TripState) => {
       lastFixTs.current = 0;
+      void acquireWakeLock();
       if (t.mode === "gps") {
         const ok = startGps();
         if (!ok) return;
@@ -180,8 +210,40 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
         startSim();
       }
     },
-    [startGps, startSim],
+    [startGps, startSim, acquireWakeLock],
   );
+
+  // When the driver returns to the app (screen back on, tab refocused), the OS
+  // may have cleared the wake lock and throttled or killed the geolocation
+  // watch. Re-acquire the lock and re-arm tracking so it keeps going.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") {
+        // Went to the background — note it so the UI can warn on return.
+        if (tripRef.current && tripRef.current.pauseStartedAt == null) setScreenLocked(true);
+        return;
+      }
+      const t = tripRef.current;
+      if (!t || t.pauseStartedAt != null) return;
+      setScreenLocked(false);
+      void acquireWakeLock();
+      // Restart the watcher cleanly rather than trusting a throttled one.
+      if (watchId.current !== null) {
+        navigator.geolocation.clearWatch(watchId.current);
+        watchId.current = null;
+      }
+      if (simTimer.current) {
+        clearInterval(simTimer.current);
+        simTimer.current = null;
+      }
+      lastFixTs.current = 0;
+      if (t.mode === "gps") startGps();
+      else startSim();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [acquireWakeLock, startGps, startSim]);
 
   /* ------------------------------------------------------- resume on mount */
 
@@ -379,11 +441,21 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
                 ) : (
                   <>
                     <b>Streaming location{mode === "sim" ? " (demo route)" : ""}.</b>{" "}
-                    Keep this page open — you can refresh and the trip continues.
+                    The screen stays on while driving. You can refresh and the trip continues.
                   </>
                 )}
               </span>
             </div>
+            {screenLocked && !onBreak && (
+              <div className="card side-note" style={{ borderLeftColor: "var(--org)" }}>
+                <svg style={{ width: 15, height: 15, color: "var(--org)" }}><use href="#i-warn" /></svg>
+                <span>
+                  <b>The phone was locked.</b> Location can&apos;t update while the screen is off,
+                  so that stretch isn&apos;t on the map. For hands-off tracking, ask your owner to
+                  fit a GPS device — it reports even with the phone away.
+                </span>
+              </div>
+            )}
           </>
         )}
 
