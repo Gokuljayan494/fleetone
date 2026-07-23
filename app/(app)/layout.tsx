@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getSession, STAFF } from "@/lib/auth";
-import { Sidebar } from "@/components/Sidebar";
+import { AppShell } from "@/components/AppShell";
 
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   const session = await getSession();
@@ -8,10 +8,5 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   // driver app, not bounced to the login screen.
   if (!session) redirect("/login");
   if (!STAFF.includes(session.role)) redirect("/driver");
-  return (
-    <div className="shell">
-      <Sidebar />
-      <div className="main">{children}</div>
-    </div>
-  );
+  return <AppShell>{children}</AppShell>;
 }

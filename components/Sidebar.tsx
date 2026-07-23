@@ -42,7 +42,7 @@ const groups: { label: string | null; items: { href: string; icon: string; label
   },
 ];
 
-export function Sidebar() {
+export function Sidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
   const path = usePathname();
   // Badge counts are the signed-in company's own — never a fixed number.
   const [counts, setCounts] = useState<{ maintenance: number; notifications: number }>({
@@ -70,12 +70,20 @@ export function Sidebar() {
       <div className="brand">
         <span className="logo-mark"><I name="bolt" /></span>
         FleetOne
+        <button className="sb-close icon-btn" onClick={onNavigate} aria-label="Close menu">
+          <I name="close" />
+        </button>
       </div>
       {groups.map((g, gi) => (
         <div key={gi} style={{ display: "contents" }}>
           {g.label && <div className="grp">{g.label}</div>}
           {g.items.map((it) => (
-            <Link key={it.href} href={it.href} className={`nav-i${path === it.href ? " on" : ""}`}>
+            <Link
+              key={it.href}
+              href={it.href}
+              className={`nav-i${path === it.href ? " on" : ""}`}
+              onClick={onNavigate}
+            >
               <I name={it.icon} />
               {it.label}
               {it.badge && counts[it.badge] > 0 ? <span className="ct">{counts[it.badge]}</span> : null}

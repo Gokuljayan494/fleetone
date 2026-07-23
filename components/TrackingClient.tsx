@@ -35,9 +35,20 @@ function since(ms: number): string {
   return `${Math.floor(h / 24)}d`;
 }
 
+type Filter = "all" | "moving" | "stopped" | "nosignal";
+
+const MATCH: Record<Filter, (s: Status) => boolean> = {
+  all: () => true,
+  moving: (s) => s === "moving",
+  stopped: (s) => s === "idle",
+  nosignal: (s) => s === "stale" || s === "offline",
+};
+
 export function TrackingClient() {
   const [data, setData] = useState<Data | null>(null);
   const [focus, setFocus] = useState<string | undefined>(undefined);
+  const [filter, setFilter] = useState<Filter>("all");
+  const [query, setQuery] = useState("");
 
   useEffect(() => {
     let live = true;
@@ -63,60 +74,116 @@ export function TrackingClient() {
   const missing = data?.missing ?? [];
   const s = data?.summary;
 
+  const q = query.trim().toUpperCase();
+  // The list and the map both obey the status filter and the search box.
+  const shownPositions = positions.filter(
+    (p) => MATCH[filter](p.status) && (!q || p.plate.toUpperCase().includes(q)),
+  );
+  const shownMissing =
+    filter === "all" || filter === "nosignal"
+      ? missing.filter((v) => !q || v.plate.toUpperCase().includes(q))
+      : [];
+
+  // When one vehicle is selected, the map follows just it; otherwise it shows
+  // exactly the filtered set.
+  const mapPlates = focus ? [focus] : shownPositions.map((p) => p.plate);
+
+  const FILTERS: { key: Filter; label: string; n: number }[] = [
+    { key: "all", label: "All", n: positions.length + missing.length },
+    { key: "moving", label: "Moving", n: s?.moving ?? 0 },
+    { key: "stopped", label: "Stopped", n: s?.idle ?? 0 },
+    { key: "nosignal", label: "No signal", n: (s?.stale ?? 0) + (s?.offline ?? 0) + (s?.neverReported ?? 0) },
+  ];
+
   return (
-    <div className="content" style={{ flexDirection: "row", display: "flex", gap: 14 }}>
-      <div className="card" style={{ flex: 1, overflow: "hidden", minHeight: 540, padding: 14 }}>
-        <div className="card-h" style={{ paddingBottom: 10 }}>
-          <h3>{focus ? focus : "All vehicles"}</h3>
-          {s && (
-            <div className="right legend">
-              <span><i style={{ background: COLOR.moving }} />{s.moving} moving</span>
-              <span><i style={{ background: COLOR.idle }} />{s.idle} stopped</span>
-              <span><i style={{ background: COLOR.stale }} />{s.stale + s.offline} no signal</span>
-            </div>
-          )}
+    <div className="content">
+      <div className="filters">
+        {FILTERS.map((f) => (
+          <button
+            key={f.key}
+            className={`fpill${filter === f.key ? " on" : ""}`}
+            onClick={() => {
+              setFilter(f.key);
+              setFocus(undefined);
+            }}
+          >
+            {f.key !== "all" && (
+              <i
+                style={{
+                  background:
+                    f.key === "moving" ? COLOR.moving : f.key === "stopped" ? COLOR.idle : COLOR.stale,
+                }}
+              />
+            )}
+            {f.label} {f.n}
+          </button>
+        ))}
+        <div className="track-search push">
+          <I name="search" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search plate…"
+            aria-label="Search vehicles"
+          />
         </div>
-        <RealMap height={480} focusPlate={focus} zoom={focus ? 12 : 8} />
       </div>
 
-      <div className="col" style={{ width: 300, flexShrink: 0 }}>
-        <div className="card" style={{ padding: "15px 16px" }}>
-          <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline", marginBottom: 11 }}>
-            <h3 style={{ fontSize: 12.5 }}>Fleet</h3>
-            {focus && (
-              <button className="btn btn-g" style={{ padding: "2px 6px", fontSize: 10.5 }} onClick={() => setFocus(undefined)}>
-                Show all
-              </button>
+      <div className="track-grid">
+        <div className="card" style={{ overflow: "hidden", minHeight: 420, padding: 14 }}>
+          <div className="card-h" style={{ paddingBottom: 10 }}>
+            <h3>{focus ? focus : FILTERS.find((f) => f.key === filter)?.label + " vehicles"}</h3>
+            {s && (
+              <div className="right legend">
+                <span><i style={{ background: COLOR.moving }} />{s.moving} moving</span>
+                <span><i style={{ background: COLOR.idle }} />{s.idle} stopped</span>
+                <span><i style={{ background: COLOR.stale }} />{s.stale + s.offline} no signal</span>
+              </div>
             )}
           </div>
+          <RealMap height={460} focusPlate={focus} showPlates={mapPlates} zoom={focus ? 12 : 8} />
+        </div>
 
-          {!data ? (
-            <div style={{ fontSize: 11.5, color: "var(--mut)" }}>Locating vehicles…</div>
-          ) : positions.length === 0 && missing.length === 0 ? (
-            <div style={{ fontSize: 11.5, color: "var(--mut)" }}>No vehicles in this fleet yet.</div>
-          ) : (
-            <div className="fleet-live">
-              {positions.map((p) => (
-                <div
-                  key={p.plate}
-                  className={`row-v${focus === p.plate ? " on" : ""}`}
-                  onClick={() => setFocus(focus === p.plate ? undefined : p.plate)}
-                >
-                  <span className="pin" style={{ background: COLOR[p.status] }} />
-                  <span className="nm">
-                    <b>{p.plate}</b>
-                    <span>{LABEL[p.status]} · {Math.round(p.speed)} km/h</span>
-                  </span>
-                  <span className="age">{since(p.ageMs)}</span>
-                </div>
-              ))}
+        <div className="col track-side">
+          <div className="card" style={{ padding: "15px 16px" }}>
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "baseline", marginBottom: 11 }}>
+              <h3 style={{ fontSize: 12.5 }}>Fleet</h3>
+              {focus && (
+                <button className="btn btn-g" style={{ padding: "2px 6px", fontSize: 10.5 }} onClick={() => setFocus(undefined)}>
+                  Show all
+                </button>
+              )}
+            </div>
 
-              {missing.length > 0 && (
+            {!data ? (
+              <div style={{ fontSize: 11.5, color: "var(--mut)" }}>Locating vehicles…</div>
+            ) : positions.length === 0 && missing.length === 0 ? (
+              <div style={{ fontSize: 11.5, color: "var(--mut)" }}>No vehicles in this fleet yet.</div>
+            ) : shownPositions.length === 0 && shownMissing.length === 0 ? (
+              <div style={{ fontSize: 11.5, color: "var(--mut)" }}>No vehicles match this filter.</div>
+            ) : (
+              <div className="fleet-live">
+                {shownPositions.map((p) => (
+                  <div
+                    key={p.plate}
+                    className={`row-v${focus === p.plate ? " on" : ""}`}
+                    onClick={() => setFocus(focus === p.plate ? undefined : p.plate)}
+                  >
+                    <span className="pin" style={{ background: COLOR[p.status] }} />
+                    <span className="nm">
+                      <b>{p.plate}</b>
+                      <span>{LABEL[p.status]} · {Math.round(p.speed)} km/h</span>
+                    </span>
+                    <span className="age">{since(p.ageMs)}</span>
+                  </div>
+                ))}
+
+              {shownMissing.length > 0 && (
                 <>
                   <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: ".07em", color: "var(--soft)", margin: "10px 0 4px", padding: "0 10px" }}>
                     NOT REPORTING
                   </div>
-                  {missing.map((v) => (
+                  {shownMissing.map((v) => (
                     <div key={v.plate} className="row-v" style={{ cursor: "default", opacity: 0.75 }}>
                       <span className="pin" style={{ background: "var(--soft)" }} />
                       <span className="nm">
@@ -152,15 +219,16 @@ export function TrackingClient() {
           );
         })()}
 
-        {missing.length > 0 && (
-          <div className="card side-note">
-            <I name="warn" />
-            <span>
-              <b>{missing.length} vehicle{missing.length === 1 ? "" : "s"} not reporting.</b>{" "}
-              They appear once a driver signs in on their phone, or a GPS box posts with your device key.
-            </span>
-          </div>
-        )}
+          {missing.length > 0 && (
+            <div className="card side-note">
+              <I name="warn" />
+              <span>
+                <b>{missing.length} vehicle{missing.length === 1 ? "" : "s"} not reporting.</b>{" "}
+                They appear once a driver signs in on their phone, or a GPS box posts with your device key.
+              </span>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

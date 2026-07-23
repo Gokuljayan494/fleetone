@@ -49,11 +49,14 @@ export function RealMap({
   focusPlate,
   showFuel = true,
   zoom = 8,
+  showPlates,
 }: {
   height?: number | string;
   focusPlate?: string;
   showFuel?: boolean;
   zoom?: number;
+  /** When set, only these plates are drawn — used by the tracking filter. */
+  showPlates?: string[] | null;
 }) {
   const divRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<LMap | null>(null);
@@ -61,6 +64,14 @@ export function RealMap({
   const fuelLayerRef = useRef<LayerGroup | null>(null);
   const didFitRef = useRef(false);
   const [empty, setEmpty] = useState<{ vehicles: number } | null>(null);
+
+  // Read the filter through a ref so changing it re-draws without tearing the
+  // map down and rebuilding it.
+  const showPlatesRef = useRef(showPlates);
+  useEffect(() => {
+    showPlatesRef.current = showPlates;
+    didFitRef.current = false; // refit the camera to the new selection
+  }, [showPlates]);
 
   useEffect(() => {
     let cancelled = false;
@@ -111,7 +122,12 @@ export function RealMap({
           const layer = layerRef.current;
           layer.clearLayers();
 
-          const shown = focusPlate ? data.positions.filter((p) => p.plate === focusPlate) : data.positions;
+          let shown = data.positions;
+          if (focusPlate) shown = shown.filter((p) => p.plate === focusPlate);
+          else if (showPlatesRef.current) {
+            const allow = new Set(showPlatesRef.current);
+            shown = shown.filter((p) => allow.has(p.plate));
+          }
 
           // Nothing has ever reported — say so rather than showing bare tiles.
           setEmpty(

@@ -6,12 +6,12 @@
  *
  * - API calls (/api/*) and non-GET requests always go to the network, never a
  *   cache, so a driver never sees stale positions, trips or auth state.
- * - Page navigations are network-first, falling back to the cached shell only
- *   when truly offline.
- * - Static assets are cached so the app paints instantly on a flaky connection.
+ * - Everything else is network-first: the freshest version always wins when
+ *   online, and the cache is only a fallback for when the connection drops.
+ *   (Cache-first would serve stale CSS/JS after an update — avoided here.)
  */
 
-const VERSION = "fleetone-v1";
+const VERSION = "fleetone-v2";
 const SHELL = `${VERSION}-shell`;
 
 self.addEventListener("install", (event) => {
@@ -38,7 +38,7 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET" || url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/")) return;
 
-  // Page navigations: try the network first, fall back to the shell offline.
+  // Page navigations: network first, fall back to the cached shell offline.
   if (request.mode === "navigate") {
     event.respondWith(
       fetch(request).catch(() => caches.match("/").then((r) => r ?? Response.error())),
@@ -46,18 +46,17 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static assets: serve from cache if present, otherwise fetch and cache.
+  // Everything else (CSS, JS, icons): network first so updates always win,
+  // updating the cache as we go; only fall back to cache when offline.
   event.respondWith(
-    caches.match(request).then(
-      (cached) =>
-        cached ??
-        fetch(request).then((res) => {
-          if (res.ok && (res.type === "basic" || res.type === "default")) {
-            const copy = res.clone();
-            caches.open(SHELL).then((cache) => cache.put(request, copy));
-          }
-          return res;
-        }),
-    ),
+    fetch(request)
+      .then((res) => {
+        if (res.ok && (res.type === "basic" || res.type === "default")) {
+          const copy = res.clone();
+          caches.open(SHELL).then((cache) => cache.put(request, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(request).then((r) => r ?? Response.error())),
   );
 });
