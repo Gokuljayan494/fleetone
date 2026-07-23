@@ -595,7 +595,7 @@ export async function listTripsSince(companyId: string, since: number): Promise<
     .toArray();
 }
 
-export async function endTrip(companyId: string, input: TripEndInput, ratePerKm: number): Promise<Trip> {
+export async function endTrip(companyId: string, input: TripEndInput): Promise<Trip> {
   const h = Math.floor(input.minutes / 60);
   const m = Math.round(input.minutes % 60);
   const vehicle = await findVehicle(companyId, input.plate);
@@ -609,7 +609,9 @@ export async function endTrip(companyId: string, input: TripEndInput, ratePerKm:
     customer: input.customer ?? "Ad-hoc trip",
     km: `${Math.round(input.km)} km`,
     dur: h ? `${h}h ${m.toString().padStart(2, "0")}m` : `${m}m`,
-    rev: `₹${Math.round(input.km * ratePerKm).toLocaleString("en-IN")}`,
+    // A trip records distance and time only. Money is raised against the
+    // customer in Billing — a fixed per-km guess here is not real revenue.
+    rev: "—",
     status: "Completed",
     tone: "emr" as Status,
   };
@@ -983,8 +985,9 @@ const monthKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}`;
  * numbers. Returns the last `count` months including the current one.
  */
 async function monthlySeries(companyId: string, count = 6) {
-  const [tripDocs, fuel, expenses, maint] = await Promise.all([
-    (await C.trips()).find({ companyId }, { projection: { _id: 0, rev: 1, createdAt: 1 } }).toArray(),
+  const [invoices, fuel, expenses, maint] = await Promise.all([
+    // Revenue is what was billed — trips no longer carry a money amount.
+    listInvoices(companyId),
     listFuelLogs(companyId),
     listExpenses(companyId),
     listMaintenance(companyId),
@@ -1002,7 +1005,9 @@ async function monthlySeries(companyId: string, count = 6) {
     if (b) b[field] += amount;
   };
 
-  for (const t of tripDocs) addTo(new Date(t.createdAt), "revenueInr", parseInr(t.rev));
+  for (const inv of invoices) {
+    if (inv.status !== "draft") addTo(new Date(`${inv.issuedOn}T00:00:00`), "revenueInr", inv.totalInr);
+  }
   for (const f of fuel) addTo(new Date(f.ts), "expensesInr", f.amountInr);
   for (const e of expenses) addTo(new Date(`${e.date}T00:00:00`), "expensesInr", e.amountInr);
   for (const m of maint) addTo(new Date(m.createdAt), "expensesInr", m.costInr ?? 0);
@@ -1025,7 +1030,8 @@ export async function buildReport(companyId: string, alertDays: number) {
     listInvoices(companyId),
   ]);
 
-  const revenue = trips.reduce((s, t) => s + parseInr(t.rev), 0);
+  // Revenue is billed money — the sum of every issued (non-draft) invoice.
+  const revenue = invoices.filter((i) => i.status !== "draft").reduce((s, i) => s + i.totalInr, 0);
   const km = trips.reduce((s, t) => s + parseKm(t.km), 0);
   const fuelSpend = fuel.reduce((s, f) => s + f.amountInr, 0);
   const otherSpend = expenses.reduce((s, e) => s + e.amountInr, 0);
@@ -1038,9 +1044,10 @@ export async function buildReport(companyId: string, alertDays: number) {
     ? Math.round((rated.reduce((s, f) => s + (f.kmpl ?? 0), 0) / rated.length) * 10) / 10
     : null;
 
+  // Per-vehicle cost is attributable; revenue is not (invoices bill a customer,
+  // not a plate), so we report running cost per vehicle rather than a fake profit.
   const perVehicle = vehicles.map((v) => {
     const vTrips = trips.filter((t) => t.plate === v.plate);
-    const vRevenue = vTrips.reduce((s, t) => s + parseInr(t.rev), 0);
     const vExpenses =
       fuel.filter((f) => f.plate === v.plate).reduce((s, f) => s + f.amountInr, 0) +
       expenses.filter((e) => e.plate === v.plate).reduce((s, e) => s + e.amountInr, 0) +
@@ -1050,9 +1057,7 @@ export async function buildReport(companyId: string, alertDays: number) {
       model: v.model,
       trips: vTrips.length,
       km: vTrips.reduce((s, t) => s + parseKm(t.km), 0),
-      revenueInr: vRevenue,
       expensesInr: vExpenses,
-      profitInr: vRevenue - vExpenses,
       kmpl: v.kmpl,
       health: v.health,
     };
@@ -1065,7 +1070,6 @@ export async function buildReport(companyId: string, alertDays: number) {
       vehicle: d.vehicle,
       trips: dTrips.length,
       km: dTrips.reduce((s, t) => s + parseKm(t.km), 0),
-      revenueInr: dTrips.reduce((s, t) => s + parseInr(t.rev), 0),
       rating: d.rating,
       score: d.score,
       onTime: d.onTime,

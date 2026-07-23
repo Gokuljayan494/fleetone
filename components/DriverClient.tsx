@@ -1,19 +1,17 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { I } from "./Icons";
 import { Av, Badge } from "./ui";
 import { FillUpModal } from "./FuelClient";
 import { RealMap } from "./RealMap";
-import type { vehicles as vehicleSeed } from "@/data/fleet";
+import type { Vehicle } from "@/lib/types";
 import type { FuelLog } from "@/lib/store";
-
-type Vehicle = (typeof vehicleSeed)[number];
 
 /** Simplified Bengaluru → Chennai corridor for demo mode; `stop` points idle at a fuel halt near Vellore. */
 const SIM_ROUTE: { lat: number; lng: number; stop?: boolean }[] = [
   { lat: 12.97, lng: 77.59 }, { lat: 12.88, lng: 77.75 }, { lat: 12.79, lng: 77.88 },
   { lat: 12.74, lng: 78.05 }, { lat: 12.72, lng: 78.25 }, { lat: 12.70, lng: 78.45 },
-  { lat: 12.92, lng: 79.13, stop: true }, { lat: 12.92, lng: 79.13, stop: true }, { lat: 12.92, lng: 79.13, stop: true },
+  { lat: 12.92, lng: 79.13, stop: true }, { lat: 12.92, lng: 79.13, stop: true },
   { lat: 12.95, lng: 79.33 }, { lat: 12.98, lng: 79.45 }, { lat: 13.02, lng: 79.65 },
   { lat: 13.05, lng: 79.85 }, { lat: 13.07, lng: 80.05 }, { lat: 13.08, lng: 80.21 },
 ];
@@ -24,30 +22,58 @@ function haversineKm(a: [number, number], b: [number, number]) {
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
+/**
+ * The active trip, mirrored to localStorage so a refresh (or the phone locking
+ * and the tab reloading) resumes the same trip instead of losing it. Time spent
+ * on a break does not count toward the trip clock.
+ */
+type TripState = {
+  plate: string;
+  driver: string;
+  mode: "gps" | "sim";
+  startedAt: number;
+  km: number;
+  pausedMs: number;         // total time already spent on breaks
+  pauseStartedAt: number | null; // set while currently on a break
+  simIdx: number;
+  lastLat: number | null;
+  lastLng: number | null;
+};
+
+const KEY = (plate: string) => `fleetone.trip.${plate}`;
+
 export function DriverClient({ driverName, assignedPlate }: { driverName: string; assignedPlate: string }) {
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [plate, setPlate] = useState(assignedPlate);
   const [driver, setDriver] = useState(driverName);
-  const [mode, setMode] = useState<"gps" | "sim">("sim");
-  const [active, setActive] = useState(false);
-  const [km, setKm] = useState(0);
+  const [mode, setMode] = useState<"gps" | "sim">("gps");
+
+  const [trip, setTrip] = useState<TripState | null>(null);
   const [speed, setSpeed] = useState(0);
-  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [gpsError, setGpsError] = useState<string | null>(null);
   const [summary, setSummary] = useState<string | null>(null);
   const [fuelOpen, setFuelOpen] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
-  const lastPos = useRef<[number, number] | null>(null);
-  const kmRef = useRef(0);
-  const startedAtRef = useRef<number | null>(null);
+  const tripRef = useRef<TripState | null>(null);
+  const lastFixTs = useRef<number>(0);
   const watchId = useRef<number | null>(null);
   const simTimer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const simIdx = useRef(0);
+
+  const active = trip !== null;
+  const onBreak = trip?.pauseStartedAt != null;
+
+  // Keep a ref in step with state so timers and GPS callbacks read the latest.
+  const persist = useCallback((t: TripState | null) => {
+    tripRef.current = t;
+    setTrip(t);
+    if (typeof window === "undefined") return;
+    if (t) localStorage.setItem(KEY(t.plate), JSON.stringify(t));
+  }, []);
 
   useEffect(() => {
-    fetch("/api/vehicles").then((r) => r.json()).then((d) => setVehicles(d.vehicles));
+    fetch("/api/vehicles").then((r) => r.json()).then((d) => setVehicles(d.vehicles ?? []));
   }, []);
 
   async function logout() {
@@ -55,78 +81,85 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
     window.location.href = "/driver/login";
   }
 
-  useEffect(() => {
-    if (!active || startedAt === null) return;
-    const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
-    return () => clearInterval(t);
-  }, [active, startedAt]);
+  /* --------------------------------------------------------- tracking loop */
 
-  async function post(lat: number, lng: number, spd: number, source: "phone" | "sim") {
-    try {
-      await fetch("/api/positions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ plate, lat, lng, speed: spd, source }),
-      });
-    } catch {
-      /* offline ping dropped; next one retries */
+  const post = useCallback((p: string, lat: number, lng: number, spd: number, source: "phone" | "sim") => {
+    void fetch("/api/positions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plate: p, lat, lng, speed: spd, source }),
+    }).catch(() => {
+      /* offline ping dropped; the next one retries */
+    });
+  }, []);
+
+  // One position fix — accumulate distance, derive speed, post, and persist so
+  // the running total survives a reload.
+  const onFix = useCallback(
+    (lat: number, lng: number, coordsSpeed: number | null, source: "phone" | "sim") => {
+      const t = tripRef.current;
+      if (!t || t.pauseStartedAt != null) return;
+
+      const here: [number, number] = [lat, lng];
+      const now = Date.now();
+      let spd = coordsSpeed ?? 0;
+
+      if (t.lastLat != null && t.lastLng != null) {
+        const d = haversineKm([t.lastLat, t.lastLng], here);
+        t.km += d;
+        // Phones often report coords.speed as null; derive it from movement so
+        // the driver actually sees a speed when the vehicle is moving.
+        if ((coordsSpeed == null || coordsSpeed === 0) && lastFixTs.current) {
+          const hrs = (now - lastFixTs.current) / 3_600_000;
+          if (hrs > 0) spd = d / hrs;
+        }
+      }
+      t.lastLat = lat;
+      t.lastLng = lng;
+      lastFixTs.current = now;
+      persist({ ...t });
+      setSpeed(spd);
+      post(t.plate, lat, lng, Math.min(200, Math.round(spd)), source);
+    },
+    [persist, post],
+  );
+
+  const startGps = useCallback(() => {
+    if (!navigator.geolocation) {
+      setGpsError("This browser has no GPS access — use demo mode.");
+      return false;
     }
-  }
+    watchId.current = navigator.geolocation.watchPosition(
+      (p) => onFix(p.coords.latitude, p.coords.longitude, p.coords.speed != null ? p.coords.speed * 3.6 : null, "phone"),
+      (e) =>
+        setGpsError(
+          e.code === 1
+            ? "Location permission denied — allow it in your browser, or use demo mode."
+            : "GPS signal unavailable — moving to a clearer spot may help.",
+        ),
+      // maximumAge 0 forces a fresh fix each time, so movement shows immediately.
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 },
+    );
+    return true;
+  }, [onFix]);
 
-  function tick(lat: number, lng: number, spd: number, source: "phone" | "sim") {
-    const here: [number, number] = [lat, lng];
-    if (lastPos.current) {
-      kmRef.current += haversineKm(lastPos.current, here);
-      setKm(kmRef.current);
-    }
-    lastPos.current = here;
-    setSpeed(spd);
-    void post(lat, lng, spd, source);
-  }
-
-  function start() {
-    if (!plate) return;
-    setSummary(null);
-    setGpsError(null);
-    kmRef.current = 0;
-    setKm(0);
-    lastPos.current = null;
-    startedAtRef.current = Date.now();
-    setStartedAt(startedAtRef.current);
-    setElapsed(0);
-    setActive(true);
-
-    if (mode === "gps") {
-      if (!navigator.geolocation) {
-        setGpsError("This browser has no GPS access — use demo mode.");
-        setActive(false);
+  const startSim = useCallback(() => {
+    simTimer.current = setInterval(() => {
+      const t = tripRef.current;
+      if (!t) return;
+      if (t.simIdx >= SIM_ROUTE.length) {
+        void finish();
         return;
       }
-      watchId.current = navigator.geolocation.watchPosition(
-        (p) => tick(p.coords.latitude, p.coords.longitude, (p.coords.speed ?? 0) * 3.6, "phone"),
-        (e) => {
-          setGpsError(e.code === 1 ? "Location permission denied — allow it or use demo mode." : "GPS unavailable — try demo mode.");
-          stop(false);
-        },
-        { enableHighAccuracy: true, maximumAge: 3000 },
-      );
-    } else {
-      simIdx.current = 0;
-      simTimer.current = setInterval(() => {
-        const i = simIdx.current;
-        if (i >= SIM_ROUTE.length) {
-          stop(true);
-          return;
-        }
-        const wp = SIM_ROUTE[i];
-        const jitter = wp.stop ? () => 0 : () => (Math.random() - 0.5) * 0.01;
-        tick(wp.lat + jitter(), wp.lng + jitter(), wp.stop ? 0.5 : 38 + Math.random() * 18, "sim");
-        simIdx.current += 1;
-      }, 2500);
-    }
-  }
+      const wp = SIM_ROUTE[t.simIdx];
+      const jit = wp.stop ? 0 : (Math.random() - 0.5) * 0.01;
+      t.simIdx += 1;
+      onFix(wp.lat + jit, wp.lng + jit, wp.stop ? 0 : 40 + Math.random() * 18, "sim");
+    }, 2500);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onFix]);
 
-  function stop(complete: boolean) {
+  const stopTracking = useCallback(() => {
     if (watchId.current !== null) {
       navigator.geolocation.clearWatch(watchId.current);
       watchId.current = null;
@@ -135,22 +168,120 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
       clearInterval(simTimer.current);
       simTimer.current = null;
     }
-    setActive(false);
+  }, []);
+
+  const beginTracking = useCallback(
+    (t: TripState) => {
+      lastFixTs.current = 0;
+      if (t.mode === "gps") {
+        const ok = startGps();
+        if (!ok) return;
+      } else {
+        startSim();
+      }
+    },
+    [startGps, startSim],
+  );
+
+  /* ------------------------------------------------------- resume on mount */
+
+  // If a trip was in progress when the page was last open, pick it back up.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const raw = localStorage.getItem(KEY(assignedPlate));
+    if (!raw) return;
+    try {
+      const t = JSON.parse(raw) as TripState;
+      tripRef.current = t;
+      setTrip(t);
+      setPlate(t.plate);
+      setDriver(t.driver);
+      setMode(t.mode);
+      if (t.pauseStartedAt == null) beginTracking(t);
+    } catch {
+      localStorage.removeItem(KEY(assignedPlate));
+    }
+    return () => stopTracking();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assignedPlate]);
+
+  // Trip clock — excludes time spent on breaks.
+  useEffect(() => {
+    if (!active) return;
+    const tick = () => {
+      const t = tripRef.current;
+      if (!t) return;
+      const pausedNow = t.pauseStartedAt != null ? Date.now() - t.pauseStartedAt : 0;
+      setElapsed(Math.max(0, Math.floor((Date.now() - t.startedAt - t.pausedMs - pausedNow) / 1000)));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [active, onBreak]);
+
+  /* ------------------------------------------------------------- controls */
+
+  function start() {
+    if (!plate) return;
+    setSummary(null);
+    setGpsError(null);
+    const t: TripState = {
+      plate, driver, mode,
+      startedAt: Date.now(),
+      km: 0, pausedMs: 0, pauseStartedAt: null,
+      simIdx: 0, lastLat: null, lastLng: null,
+    };
+    persist(t);
     setSpeed(0);
-    if (complete && startedAtRef.current !== null && kmRef.current > 0.1) {
-      const minutes = (Date.now() - startedAtRef.current) / 60_000;
-      const totalKm = kmRef.current;
-      setSummary(`${totalKm.toFixed(1)} km in ${Math.max(1, Math.round(minutes))} min — trip saved`);
-      void fetch("/api/trips", {
+    setElapsed(0);
+    beginTracking(t);
+  }
+
+  function takeBreak() {
+    const t = tripRef.current;
+    if (!t || t.pauseStartedAt != null) return;
+    stopTracking();
+    setSpeed(0);
+    persist({ ...t, pauseStartedAt: Date.now(), lastLat: null, lastLng: null });
+  }
+
+  function resume() {
+    const t = tripRef.current;
+    if (!t || t.pauseStartedAt == null) return;
+    const resumed: TripState = {
+      ...t,
+      pausedMs: t.pausedMs + (Date.now() - t.pauseStartedAt),
+      pauseStartedAt: null,
+    };
+    persist(resumed);
+    beginTracking(resumed);
+  }
+
+  async function finish() {
+    const t = tripRef.current;
+    stopTracking();
+    if (typeof window !== "undefined" && t) localStorage.removeItem(KEY(t.plate));
+    tripRef.current = null;
+    setTrip(null);
+    setSpeed(0);
+
+    if (t && t.km > 0.1) {
+      const pausedNow = t.pauseStartedAt != null ? Date.now() - t.pauseStartedAt : 0;
+      const minutes = Math.max(1, (Date.now() - t.startedAt - t.pausedMs - pausedNow) / 60_000);
+      setSummary(`${t.km.toFixed(1)} km in ${Math.round(minutes)} min — trip saved`);
+      await fetch("/api/trips", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ plate, driver, km: totalKm, minutes }),
-      });
+        body: JSON.stringify({ plate: t.plate, driver: t.driver, km: t.km, minutes }),
+      }).catch(() => {});
+    } else {
+      setSummary("Trip discarded — too short to record.");
     }
   }
 
   const mins = Math.floor(elapsed / 60), secs = elapsed % 60;
   const vehicle = vehicles.find((v) => v.plate === plate);
+  const km = trip?.km ?? 0;
 
   return (
     <div className="drv">
@@ -161,7 +292,7 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
           <div className="crumb">{driver || "No driver selected"}</div>
         </div>
         {active ? (
-          <span className="drv-live"><span className="dot" />LIVE</span>
+          onBreak ? <Badge tone="org">On break</Badge> : <span className="drv-live"><span className="dot" />LIVE</span>
         ) : (
           <Badge tone="slate">Off duty</Badge>
         )}
@@ -200,14 +331,25 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
           </div>
         )}
 
-        {active ? (
-          <button className="drv-big stop" onClick={() => stop(true)}>
-            <I name="check" />End trip
-          </button>
-        ) : (
+        {!active ? (
           <button className="drv-big go" onClick={start} disabled={!plate}>
             <I name="route" />Start trip
           </button>
+        ) : (
+          <>
+            {onBreak ? (
+              <button className="drv-big go" onClick={resume}>
+                <I name="route" />Resume trip
+              </button>
+            ) : (
+              <button className="drv-big brk" onClick={takeBreak}>
+                <I name="pause" />Take a break
+              </button>
+            )}
+            <button className="btn btn-s full" style={{ padding: 12 }} onClick={finish}>
+              <I name="check" />End trip
+            </button>
+          </>
         )}
 
         {gpsError && <div className="form-err">{gpsError}</div>}
@@ -227,13 +369,19 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
         {active && (
           <>
             <div className="card" style={{ padding: 8 }}>
-              <RealMap height={220} focusPlate={plate} zoom={12} />
+              <RealMap height={220} focusPlate={plate} showFuel={false} zoom={13} />
             </div>
-            <div className="card side-note" style={{ borderLeftColor: "var(--ind)" }}>
-              <svg style={{ width: 15, height: 15, color: "var(--ind)" }}><use href="#i-pin" /></svg>
+            <div className="card side-note" style={{ borderLeftColor: onBreak ? "var(--org)" : "var(--ind)" }}>
+              <svg style={{ width: 15, height: 15, color: onBreak ? "var(--org)" : "var(--ind)" }}><use href="#i-pin" /></svg>
               <span>
-                <b>Streaming location{mode === "sim" ? " (demo route: Bengaluru → Chennai)" : ""}.</b>{" "}
-                Keep this page open — position updates every few seconds.
+                {onBreak ? (
+                  <><b>On a break.</b> Tracking is paused and the clock is stopped. Tap Resume when you set off again.</>
+                ) : (
+                  <>
+                    <b>Streaming location{mode === "sim" ? " (demo route)" : ""}.</b>{" "}
+                    Keep this page open — you can refresh and the trip continues.
+                  </>
+                )}
               </span>
             </div>
           </>
@@ -258,7 +406,7 @@ export function DriverClient({ driverName, assignedPlate }: { driverName: string
       {fuelOpen && (
         <FillUpModal
           vehicles={vehicles.filter((v) => v.plate === plate)}
-          coords={lastPos.current ? { lat: lastPos.current[0], lng: lastPos.current[1] } : null}
+          coords={trip?.lastLat != null && trip.lastLng != null ? { lat: trip.lastLat, lng: trip.lastLng } : null}
           onClose={() => setFuelOpen(false)}
           onAdded={(log: FuelLog) => {
             setFuelOpen(false);

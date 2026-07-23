@@ -35,5 +35,5 @@ export async function POST(req: Request) {
       ? { ...body, driver: ctx.session.name, plate: ctx.session.plate }
       : body;
 
-  return ok({ trip: await endTrip(ctx.companyId, input, ctx.company.settings.ratePerKm) }, 201);
+  return ok({ trip: await endTrip(ctx.companyId, input) }, 201);
 }

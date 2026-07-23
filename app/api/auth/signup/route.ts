@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { AUTH_COOKIE, createSession } from "@/lib/auth";
+import { createSession, sessionCookie } from "@/lib/auth";
 import { fail, invalid, ok, parseBody } from "@/lib/api";
 import { SignupSchema } from "@/lib/schemas";
 import { bootstrap, createCompany } from "@/lib/store";
@@ -38,6 +38,6 @@ export async function POST(req: Request) {
     },
     201,
   );
-  res.cookies.set(AUTH_COOKIE, token, { httpOnly: true, sameSite: "lax", path: "/", maxAge: 7 * 24 * 60 * 60 });
+  res.cookies.set(sessionCookie(token));
   return res;
 }

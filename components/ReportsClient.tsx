@@ -14,7 +14,7 @@ type Report = {
     litres: number; fleetAvgKmpl: number | null;
   };
   expensesByCategory: Record<string, number>;
-  perVehicle: { plate: string; model: string; kmpl: number; profitInr: number }[];
+  perVehicle: { plate: string; model: string; kmpl: number; expensesInr: number }[];
   perDriver: { name: string; score: number; trips: number }[];
 };
 

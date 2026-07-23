@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { AUTH_COOKIE, createSession, getCompany, hashPassword } from "@/lib/auth";
+import { createSession, getCompany, hashPassword, sessionCookie } from "@/lib/auth";
 import { fail, invalid, ok, parseBody } from "@/lib/api";
 import { DriverLoginSchema, OwnerLoginSchema } from "@/lib/schemas";
 import { bootstrap, findDriverCred, findUserByEmail } from "@/lib/store";
@@ -55,6 +55,6 @@ export async function POST(req: Request) {
 
   const company = await getCompany(companyId);
   const res = ok({ ok: true, role: body.role, company: company?.name ?? "" });
-  res.cookies.set(AUTH_COOKIE, token, { httpOnly: true, sameSite: "lax", path: "/", maxAge: 7 * 24 * 60 * 60 });
+  res.cookies.set(sessionCookie(token));
   return res;
 }

@@ -6,6 +6,28 @@ import type { Company } from "./types";
 export const AUTH_COOKIE = "f1_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * One place that describes the session cookie, so login, signup and logout
+ * cannot drift apart. `secure` is on in production (HTTPS on Vercel) but off in
+ * local dev, where the server is plain http and a secure cookie would never be
+ * sent back — which looks exactly like "logged out on refresh".
+ */
+export function sessionCookie(token: string) {
+  return {
+    name: AUTH_COOKIE,
+    value: token,
+    httpOnly: true,
+    sameSite: "lax" as const,
+    path: "/",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60,
+  };
+}
+
+export function clearedCookie() {
+  return { ...sessionCookie(""), maxAge: 0 };
+}
+
 /** Every session is pinned to one company — that is what keeps fleets apart. */
 export type Session =
   | { role: "owner" | "manager"; companyId: string; userId: string; name: string; email: string; exp: number }

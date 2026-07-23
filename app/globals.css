@@ -313,6 +313,7 @@ table.tbl{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}
 .drv-big svg{width:18px;height:18px}
 .drv-big.go{background:linear-gradient(135deg,#10B981,#0DA271);color:#fff;box-shadow:0 8px 22px -6px rgba(16,185,129,.6)}
 .drv-big.stop{background:linear-gradient(135deg,#EF4444,#DC2626);color:#fff;box-shadow:0 8px 22px -6px rgba(239,68,68,.55)}
+.drv-big.brk{background:linear-gradient(135deg,#F59E0B,#D97706);color:#fff;box-shadow:0 8px 22px -6px rgba(245,158,11,.5)}
 .drv-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .drv-live{display:flex;align-items:center;gap:8px;font-size:11.5px;font-weight:600;color:var(--emr-ink)}
 .drv-live .dot{width:8px;height:8px;border-radius:50%;background:var(--emr);animation:pulse-dot 1.4s ease-in-out infinite}
