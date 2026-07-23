@@ -15,6 +15,25 @@ On first boot the app creates its indexes and seeds a demo company, so an empty
 database just works. Demo login — `arjun@fleetone.in` / `fleetone123`.
 Or create your own company at `/signup`.
 
+## Installable (PWA)
+
+FleetOne is a Progressive Web App — no app store. On a phone, "Add to Home
+Screen" installs it with its own icon and launches full-screen like a native
+app. An install prompt appears automatically (Android/Chrome shows the native
+dialog; iOS shows the Share → Add to Home Screen steps).
+
+- `app/manifest.ts` — the web manifest
+- `public/sw.js` — a deliberately minimal service worker: it makes the app
+  installable and paints the shell on a flaky connection, but never caches
+  `/api` calls or mutations, so drivers never see stale data or auth state
+- `components/InstallPWA.tsx` — registers the worker and shows the install bar
+
+**On background tracking:** installing does not grant screen-off GPS — that is
+an OS restriction no web app can lift (even native apps need special
+permission). The driver app keeps the screen awake during a trip and resumes
+cleanly when reopened; for hands-off tracking, use a hardware GPS device via
+the company device key.
+
 ## Storage
 
 MongoDB, via the official driver (no ODM — the zod schemas in `lib/schemas.ts`
